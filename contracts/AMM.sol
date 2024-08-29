@@ -253,7 +253,7 @@ contract AMM {
         uint256 roundedTotalLiquidity = (xTokenAmount * yTokenAmount) /
             multiplierWEI;
         require(
-            _roundToNearest(roundedTotalLiquidity) == pool.liquidity,
+            _roundToNearest(roundedTotalLiquidity) <= pool.liquidity,
             "Pool has Insufficiant liquidity"
         );
 
@@ -276,7 +276,7 @@ contract AMM {
         uint256 roundedTotalLiquidity = (xTokenAmount * yTokenAmount) /
             multiplierWEI;
         require(
-            _roundToNearest(roundedTotalLiquidity) == pool.liquidity,
+            _roundToNearest(roundedTotalLiquidity) <= pool.liquidity,
             "Pool has Insufficiant liquidity"
         );
 
