@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
 import "hardhat/console.sol";
-import "./XToken.sol";
-import "./YToken.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IWETH {
+    function deposit() external payable;
+
+    function withdraw(uint256 wad) external;
+}
 
 contract AMM {
     struct Pool {
@@ -14,148 +19,51 @@ contract AMM {
         uint256 amount0;
         uint256 amount1;
         uint256 liquidity;
+        uint256 POOL_FEE_NUMERATOR;
+        uint256 POOL_FEE_DENOMINATOR;
     }
 
     struct Deposit {
         bytes4 poolId;
-        address user;
+        address liquidityProvider;
         uint256 amount0;
         uint256 amount1;
+        uint256 totalTokens;
     }
 
-    bytes4 getPoolId;
+    bytes4[] getAllPools;
     mapping(bytes4 => Pool) poolData;
     mapping(address => bytes4[]) poolOwnerData;
 
-    mapping(address => mapping(bytes4 => Deposit)) deposits;
+    mapping(bytes4 => Deposit) deposits;
     mapping(address => bytes4[]) userDeposits;
 
-    constructor(string memory _poolName, address _token0, address _token1) {
-        _createPool(_poolName, _token0, _token1);
+    IWETH wethAddress;
+    address owner;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "only owner can call it.");
+        _;
     }
 
-    function addLiquidity(
-        address _userAddress,
-        bytes4 _poolId,
-        uint256 _amount0,
-        uint256 _amount1
-    ) public {
-        require(_amount0 != 0, "amount0 can't be a Zero");
-        require(_amount1 != 0, "amount1 can't be a Zero");
-        require(
-            XToken(poolData[_poolId].token0).allowance(
-                _userAddress,
-                address(this)
-            ) >= _amount0,
-            "Insufficiant allowance for amount0"
-        );
-        require(
-            YToken(poolData[_poolId].token1).allowance(
-                _userAddress,
-                address(this)
-            ) >= _amount1,
-            "Insufficiant allowance for amount1"
-        );
-
-        _addLiquidity(_userAddress, _poolId, _amount0, _amount1);
+    modifier poolExist(bytes4 _poolId) {
+        require(_poolId == poolData[_poolId].poolId, "pool doesn't Exist");
+        _;
     }
 
-    function withdrawLiquidity(
-        bytes4 _poolId,
-        uint256 _amount0,
-        uint256 _amount1
-    ) public {
-        Deposit storage depositData = deposits[msg.sender][_poolId];
-        require(_amount0 != 0, "amount0 can't be a Zero");
-        require(_amount1 != 0, "amount1 can't be a Zero");
-        require(depositData.user == msg.sender, "User doesn't Exist.");
-        require(depositData.poolId == _poolId, "Invalid PoolId.");
-        require(
-            depositData.amount0 >= _amount0,
-            "Insufficiant XToken Balance."
-        );
-        require(
-            depositData.amount1 >= _amount1,
-            "Insufficiant YToken Balance."
-        );
-        require(
-            XToken(poolData[_poolId].token0).balanceOf(address(this)) != 0,
-            "Insufficiant XToken in pool."
-        );
-        require(
-            YToken(poolData[_poolId].token1).balanceOf(address(this)) != 0,
-            "Insufficiant YToken in pool."
-        );
-
-        XToken(poolData[_poolId].token0).transfer(msg.sender, _amount0);
-        YToken(poolData[_poolId].token1).transfer(msg.sender, _amount1);
-
-        depositData.amount0 -= _amount0;
-        depositData.amount1 -= _amount1;
-
-        Pool storage _pool = poolData[_poolId];
-        _pool.amount0 -= _amount0;
-        _pool.amount1 -= _amount1;
-        _pool.liquidity = (_pool.amount0 * _pool.amount1) / 1e18;
+    constructor(address _weth) {
+        wethAddress = IWETH(_weth);
+        owner = msg.sender;
     }
 
-    function swapTokens(
-        bytes4 _poolId,
-        address _tokenAddress,
-        uint256 _tokenQuantity
-    ) public {
-        Pool memory pool = poolData[_poolId];
-        require(pool.poolId == _poolId, "Pool doesn't exist.");
-        if (pool.token0 == _tokenAddress) {
-            // swap X to Y Tokens
-            _swapXtoY_Tokens(_poolId, _tokenAddress, _tokenQuantity);
-        } else {
-            // swap Y to X Tokens
-            _swapYtoX_Tokens(_poolId, _tokenAddress, _tokenQuantity);
-        }
-    }
-
-    function _swapXtoY_Tokens(
-        bytes4 _poolId,
-        address _tokenAddress,
-        uint256 _tokenQuantity
-    ) internal {
-        Pool storage pool = poolData[_poolId];
-        uint256 yTokens = fetchQuote(_poolId, _tokenAddress, _tokenQuantity);
-
-        XToken(pool.token0).transferFrom(
-            msg.sender,
-            address(this),
-            _tokenQuantity
-        );
-        YToken(pool.token1).transfer(msg.sender, yTokens);
-        pool.amount0 += _tokenQuantity;
-        pool.amount1 -= yTokens;
-    }
-
-    function _swapYtoX_Tokens(
-        bytes4 _poolId,
-        address _tokenAddress,
-        uint256 _tokenQuantity
-    ) internal {
-        Pool storage pool = poolData[_poolId];
-        uint256 xTokens = fetchQuote(_poolId, _tokenAddress, _tokenQuantity);
-
-        YToken(pool.token1).transferFrom(
-            msg.sender,
-            address(this),
-            _tokenQuantity
-        );
-        XToken(pool.token0).transfer(msg.sender, xTokens);
-        pool.amount0 -= xTokens;
-        pool.amount1 += _tokenQuantity;
-    }
-
-    function _createPool(
+    function createPool(
         string memory _poolName,
         address _token0,
-        address _token1
-    ) internal {
+        address _token1,
+        uint256 _poolFee_Numerator,
+        uint256 _poolFee_Denominator
+    ) public onlyOwner {
+        require(_token0 != _token1, "Both Tokens are same.");
         bytes4 _poolId = bytes4(
             keccak256(
                 abi.encodePacked(
@@ -174,138 +82,235 @@ contract AMM {
             token1: _token1,
             amount0: 0,
             amount1: 0,
-            liquidity: 0
+            liquidity: 0,
+            POOL_FEE_NUMERATOR: _poolFee_Numerator,
+            POOL_FEE_DENOMINATOR: _poolFee_Denominator
         });
         poolData[_poolId] = _pool;
         poolOwnerData[msg.sender].push(_poolId);
-        getPoolId = _poolId;
+        getAllPools.push(_poolId);
     }
 
-    function _addLiquidity(
-        address _userAddress,
+    function addLiquidity(
         bytes4 _poolId,
         uint256 _amount0,
         uint256 _amount1
-    ) internal {
-        XToken(poolData[_poolId].token0).transferFrom(
-            _userAddress,
-            address(this),
-            _amount0
-        );
-        YToken(poolData[_poolId].token1).transferFrom(
-            _userAddress,
-            address(this),
-            _amount1
-        );
+    ) public payable poolExist(_poolId) {
+        require(_amount0 != 0 && _amount1 != 0, "amount can't be a Zero");
+
+        IERC20 token0 = IERC20(poolData[_poolId].token0);
+        IERC20 token1 = IERC20(poolData[_poolId].token1);
+        
+        address _token0 = address(token0);
+        address _token1 = address(token1);
+        address _wethAddress = address(wethAddress);
+
+        if (_token0 != _wethAddress) {
+            require(
+                token0.allowance(msg.sender, address(this)) >= _amount0,
+                "Insufficiant allowance for amount0"
+            );
+            token0.transferFrom(msg.sender, address(this), _amount0);
+        }
+
+        if (_token1 != _wethAddress) {
+            require(
+                token1.allowance(msg.sender, address(this)) >= _amount1,
+                "Insufficiant allowance for amount1"
+            );
+            token1.transferFrom(msg.sender, address(this), _amount1);
+        }
+
+        if (
+            _token0 == _wethAddress ||
+            _token1 == _wethAddress
+        ) {
+            if (_token0 == _wethAddress) {
+                require(msg.value >= _amount0, "provide value.");
+                wethAddress.deposit{value: msg.value}();
+            } else if (_token1 == _wethAddress) {
+                require(msg.value >= _amount1, "provide value.");
+                wethAddress.deposit{value: msg.value}();
+            }
+        }
 
         Pool storage _pool = poolData[_poolId];
         _pool.amount0 += _amount0;
         _pool.amount1 += _amount1;
         _pool.liquidity = (_pool.amount0 * _pool.amount1) / 1e18;
 
-        _createDeposit(_userAddress, _poolId, _amount0, _amount1);
-    }
-
-    function _createDeposit(
-        address _userAddress,
-        bytes4 _poolId,
-        uint256 _amount0,
-        uint256 _amount1
-    ) internal {
         if (
-            deposits[_userAddress][_poolId].poolId == _poolId &&
-            deposits[_userAddress][_poolId].user == _userAddress
+            deposits[_poolId].poolId == _poolId &&
+            deposits[_poolId].liquidityProvider == msg.sender
         ) {
-            Deposit storage deposit = deposits[_userAddress][_poolId];
+            Deposit storage deposit = deposits[_poolId];
             deposit.amount0 += _amount0;
             deposit.amount1 += _amount1;
+            deposit.totalTokens += _amount0 + _amount1;
         } else {
             Deposit memory deposit = Deposit({
                 poolId: _poolId,
-                user: _userAddress,
+                liquidityProvider: msg.sender,
                 amount0: _amount0,
-                amount1: _amount1
+                amount1: _amount1,
+                totalTokens: _amount0 + _amount1
             });
 
-            deposits[_userAddress][_poolId] = deposit;
-            userDeposits[_userAddress].push(_poolId);
+            deposits[_poolId] = deposit;
+            userDeposits[msg.sender].push(_poolId);
         }
     }
 
-    function _roundToNearest(uint256 value) internal pure returns (uint256) {
-        uint256 precision = 1e18;
-        return ((value + (precision / 2)) / precision) * precision;
-    }
-
-    function _getYToken_Quantity(
+    function withdrawLiquidity(
         bytes4 _poolId,
-        uint256 _tokenQuantity
-    ) internal view returns (uint256 getTokenQuantity) {
-        Pool memory pool = poolData[_poolId];
-        require(pool.amount0 > _tokenQuantity, "Insufficiant liquidity");
-        uint256 xTokenAmount;
-        uint256 yTokenAmount;
-        uint256 multiplierWEI = 1e18;
-
-        xTokenAmount = pool.amount0 + _tokenQuantity;
-        yTokenAmount = (pool.liquidity * multiplierWEI) / xTokenAmount;
-
-        uint256 roundedTotalLiquidity = (xTokenAmount * yTokenAmount) /
-            multiplierWEI;
+        uint256 _amount0,
+        uint256 _amount1
+    ) public poolExist(_poolId) {
+        Deposit storage depositData = deposits[_poolId];
+        Pool storage _pool = poolData[_poolId];
+        IERC20 token0 = IERC20(_pool.token0);
+        IERC20 token1 = IERC20(_pool.token1);
         require(
-            _roundToNearest(roundedTotalLiquidity) <= pool.liquidity,
-            "Pool has Insufficiant liquidity"
+            depositData.liquidityProvider == msg.sender,
+            "User doesn't Exist."
+        );
+        require(_amount0 != 0 && _amount1 != 0, "amount can't be a Zero");
+        require(
+            depositData.amount0 >= _amount0 && depositData.amount1 >= _amount1,
+            "Insufficiant Tokens Balance."
+        );
+        require(
+            _pool.amount0 >= _amount0 && _pool.amount1 >= _amount1,
+            "Insufficiant Tokens in pool."
         );
 
-        getTokenQuantity = pool.amount1 - yTokenAmount;
+        depositData.amount0 -= _amount0;
+        depositData.amount1 -= _amount1;
+        depositData.totalTokens -= _amount0 + _amount1;
+
+        _pool.amount0 -= _amount0;
+        _pool.amount1 -= _amount1;
+        _pool.liquidity = (_pool.amount0 * _pool.amount1) / 1e18;
+
+        if (address(token0) == address(wethAddress)) {
+            wethAddress.withdraw(_amount0);
+            (bool success, ) = payable(msg.sender).call{value: _amount0}("");
+            require(success, "Transfer Failed");
+        } else {
+            token0.transfer(msg.sender, _amount0);
+        }
+
+        if (address(token1) == address(wethAddress)) {
+            wethAddress.withdraw(_amount0);
+            (bool success, ) = payable(msg.sender).call{value: _amount1}("");
+            require(success, "Transfer Failed");
+        } else {
+            token1.transfer(msg.sender, _amount1);
+        }
     }
 
-    function _getXToken_Quantity(
+    function swapTokens(
         bytes4 _poolId,
+        address _tokenIn,
+        address _tokenOut,
         uint256 _tokenQuantity
-    ) internal view returns (uint256 getTokenQuantity) {
-        Pool memory pool = poolData[_poolId];
-        require(pool.amount0 > _tokenQuantity, "Insufficiant liquidity");
-        uint256 xTokenAmount;
-        uint256 yTokenAmount;
-        uint256 multiplierWEI = 1e18;
-
-        yTokenAmount = pool.amount1 + _tokenQuantity;
-        xTokenAmount = (pool.liquidity * multiplierWEI) / yTokenAmount;
-
-        uint256 roundedTotalLiquidity = (xTokenAmount * yTokenAmount) /
-            multiplierWEI;
-        require(
-            _roundToNearest(roundedTotalLiquidity) <= pool.liquidity,
-            "Pool has Insufficiant liquidity"
+    ) public payable poolExist(_poolId) {
+        (uint256 tokens, uint256 poolFee) = fetchQuote(
+            _poolId,
+            _tokenIn,
+            _tokenQuantity
         );
 
-        getTokenQuantity = pool.amount0 - xTokenAmount;
+        if (_tokenIn == address(wethAddress)) {
+            require(msg.value >= _tokenQuantity, "provide value");
+
+            wethAddress.deposit{value: msg.value}();
+            (bool success, ) = payable(deposits[_poolId].liquidityProvider)
+                .call{value: poolFee}("");
+
+            require(success, "Transfer Failed");
+        } else {
+            IERC20(_tokenIn).transferFrom(
+                msg.sender,
+                address(this),
+                _tokenQuantity
+            );
+        }
+
+        Pool storage pool = poolData[_poolId];
+        if (pool.token0 == _tokenIn) {
+            pool.amount0 += _tokenQuantity - poolFee;
+            pool.amount1 -= tokens;
+        } else {
+            pool.amount0 -= tokens;
+            pool.amount1 += _tokenQuantity - poolFee;
+        }
+
+        if (_tokenOut == address(wethAddress)) {
+            wethAddress.withdraw(poolFee);
+            (bool success, ) = payable(msg.sender).call{value: poolFee}("");
+
+            require(success, "Transfer Failed");
+        } else {
+            IERC20(_tokenIn).transfer(
+                deposits[_poolId].liquidityProvider,
+                poolFee
+            );
+            IERC20(_tokenOut).transfer(msg.sender, tokens);
+        }
     }
 
     function fetchQuote(
         bytes4 _poolId,
-        address _tokenAddress,
+        address _tokenIn,
         uint256 _tokenQuantity
-    ) public view returns (uint256 getTokenQuantity) {
-        Pool memory pool = poolData[_poolId];
-        require(pool.poolId == _poolId, "Pool doesn't exist.");
-
-        // Return YToken Quantity
-        if (pool.token0 == _tokenAddress) {
-            getTokenQuantity = _getYToken_Quantity(_poolId, _tokenQuantity);
-        }
-        // Return XToken Quantity
-        else {
-            getTokenQuantity = _getXToken_Quantity(_poolId, _tokenQuantity);
-        }
-    }
-
-    function getPool(
-        bytes4 _poolId
     )
         public
         view
+        poolExist(_poolId)
+        returns (uint256 getTokenQuantity, uint256 poolFee)
+    {
+        require(_tokenQuantity != 0, "Can't swap 0 token.");
+
+        uint256 divisibleToken;
+        uint256 recievableToken;
+        uint256 poolFeeFromBaseToken;
+        uint256 multiplierWEI = 1e18;
+        Pool memory pool = poolData[_poolId];
+
+        poolFeeFromBaseToken =
+            (_tokenQuantity * pool.POOL_FEE_NUMERATOR) /
+            pool.POOL_FEE_DENOMINATOR;
+
+        divisibleToken =
+            (pool.token0 == _tokenIn ? pool.amount0 : pool.amount1) +
+            (_tokenQuantity - poolFeeFromBaseToken);
+        recievableToken = (pool.liquidity * multiplierWEI) / divisibleToken;
+
+        console.log("pool.amount0 : ", pool.amount0);
+        console.log("pool.amount1 : ", pool.amount1);
+        console.log("pool.liquidity : ", pool.liquidity);
+        console.log("_tokenQuantity : ", _tokenQuantity);
+        console.log("poolFeeFromBaseToken : ", poolFeeFromBaseToken);
+        console.log("divisibleToken : ", divisibleToken);
+        console.log("recievableToken : ", recievableToken);
+
+        require(
+            (divisibleToken * recievableToken) / multiplierWEI <=
+                pool.liquidity,
+            "Pool has Insufficiant liquidity"
+        );
+
+        getTokenQuantity =
+            (pool.token0 == _tokenIn ? pool.amount1 : pool.amount0) -
+            recievableToken;
+        poolFee = poolFeeFromBaseToken;
+    }
+
+    function getPool(bytes4 _poolId)
+        public
+        view
+        poolExist(_poolId)
         returns (
             bytes4 poolId,
             string memory poolName,
@@ -313,7 +318,9 @@ contract AMM {
             address token1,
             uint256 amount0,
             uint256 amount1,
-            uint256 liquidity
+            uint256 liquidity,
+            uint256 POOL_FEE_NUMERATOR,
+            uint256 POOL_FEE_DENOMINATOR
         )
     {
         Pool memory pool = poolData[_poolId];
@@ -324,31 +331,39 @@ contract AMM {
             pool.token1,
             pool.amount0,
             pool.amount1,
-            pool.liquidity
+            pool.liquidity,
+            pool.POOL_FEE_NUMERATOR,
+            pool.POOL_FEE_DENOMINATOR
         );
     }
 
-    function getPoolHistory() public view returns (bytes4[] memory) {
+    function getPoolHistory() public view onlyOwner returns (bytes4[] memory) {
         return poolOwnerData[msg.sender];
     }
 
-    function getPoolForAllUser() public view returns (bytes4) {
-        return getPoolId;
+    function getPoolForAllUser() public view returns (bytes4[] memory) {
+        return getAllPools;
     }
 
-    function getDeposit(
-        bytes4 _poolId
-    )
+    function getDeposit(bytes4 _poolId)
         public
         view
-        returns (bytes4 poolId, address user, uint256 amount0, uint256 amount1)
+        poolExist(_poolId)
+        returns (
+            bytes4 poolId,
+            address liquidityProvider,
+            uint256 amount0,
+            uint256 amount1,
+            uint256 totalTokens
+        )
     {
-        Deposit memory _deposit = deposits[msg.sender][_poolId];
+        Deposit memory _deposit = deposits[_poolId];
         return (
             _deposit.poolId,
-            _deposit.user,
+            _deposit.liquidityProvider,
             _deposit.amount0,
-            _deposit.amount1
+            _deposit.amount1,
+            _deposit.totalTokens
         );
     }
 
