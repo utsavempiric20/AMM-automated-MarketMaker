@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.19;
 
 import "hardhat/console.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-
-interface IWETH {
-    function deposit() external payable;
-
-    function withdraw(uint256 wad) external;
-}
 
 contract AMM {
     struct Pool {
@@ -38,7 +32,6 @@ contract AMM {
     mapping(bytes4 => Deposit) deposits;
     mapping(address => bytes4[]) userDeposits;
 
-    IWETH wethAddress;
     address owner;
 
     modifier onlyOwner() {
@@ -51,8 +44,7 @@ contract AMM {
         _;
     }
 
-    constructor(address _weth) {
-        wethAddress = IWETH(_weth);
+    constructor() {
         owner = msg.sender;
     }
 
@@ -100,39 +92,18 @@ contract AMM {
 
         IERC20 token0 = IERC20(poolData[_poolId].token0);
         IERC20 token1 = IERC20(poolData[_poolId].token1);
-        
-        address _token0 = address(token0);
-        address _token1 = address(token1);
-        address _wethAddress = address(wethAddress);
 
-        if (_token0 != _wethAddress) {
-            require(
-                token0.allowance(msg.sender, address(this)) >= _amount0,
-                "Insufficiant allowance for amount0"
-            );
-            token0.transferFrom(msg.sender, address(this), _amount0);
-        }
+        require(
+            token0.allowance(msg.sender, address(this)) >= _amount0,
+            "Insufficiant allowance for amount0"
+        );
+        require(
+            token1.allowance(msg.sender, address(this)) >= _amount1,
+            "Insufficiant allowance for amount1"
+        );
 
-        if (_token1 != _wethAddress) {
-            require(
-                token1.allowance(msg.sender, address(this)) >= _amount1,
-                "Insufficiant allowance for amount1"
-            );
-            token1.transferFrom(msg.sender, address(this), _amount1);
-        }
-
-        if (
-            _token0 == _wethAddress ||
-            _token1 == _wethAddress
-        ) {
-            if (_token0 == _wethAddress) {
-                require(msg.value >= _amount0, "provide value.");
-                wethAddress.deposit{value: msg.value}();
-            } else if (_token1 == _wethAddress) {
-                require(msg.value >= _amount1, "provide value.");
-                wethAddress.deposit{value: msg.value}();
-            }
-        }
+        token0.transferFrom(msg.sender, address(this), _amount0);
+        token1.transferFrom(msg.sender, address(this), _amount1);
 
         Pool storage _pool = poolData[_poolId];
         _pool.amount0 += _amount0;
@@ -192,21 +163,8 @@ contract AMM {
         _pool.amount1 -= _amount1;
         _pool.liquidity = (_pool.amount0 * _pool.amount1) / 1e18;
 
-        if (address(token0) == address(wethAddress)) {
-            wethAddress.withdraw(_amount0);
-            (bool success, ) = payable(msg.sender).call{value: _amount0}("");
-            require(success, "Transfer Failed");
-        } else {
-            token0.transfer(msg.sender, _amount0);
-        }
-
-        if (address(token1) == address(wethAddress)) {
-            wethAddress.withdraw(_amount0);
-            (bool success, ) = payable(msg.sender).call{value: _amount1}("");
-            require(success, "Transfer Failed");
-        } else {
-            token1.transfer(msg.sender, _amount1);
-        }
+        token0.transfer(msg.sender, _amount0);
+        token1.transfer(msg.sender, _amount1);
     }
 
     function swapTokens(
@@ -221,21 +179,11 @@ contract AMM {
             _tokenQuantity
         );
 
-        if (_tokenIn == address(wethAddress)) {
-            require(msg.value >= _tokenQuantity, "provide value");
-
-            wethAddress.deposit{value: msg.value}();
-            (bool success, ) = payable(deposits[_poolId].liquidityProvider)
-                .call{value: poolFee}("");
-
-            require(success, "Transfer Failed");
-        } else {
-            IERC20(_tokenIn).transferFrom(
-                msg.sender,
-                address(this),
-                _tokenQuantity
-            );
-        }
+        IERC20(_tokenIn).transferFrom(
+            msg.sender,
+            address(this),
+            _tokenQuantity
+        );
 
         Pool storage pool = poolData[_poolId];
         if (pool.token0 == _tokenIn) {
@@ -246,18 +194,8 @@ contract AMM {
             pool.amount1 += _tokenQuantity - poolFee;
         }
 
-        if (_tokenOut == address(wethAddress)) {
-            wethAddress.withdraw(poolFee);
-            (bool success, ) = payable(msg.sender).call{value: poolFee}("");
-
-            require(success, "Transfer Failed");
-        } else {
-            IERC20(_tokenIn).transfer(
-                deposits[_poolId].liquidityProvider,
-                poolFee
-            );
-            IERC20(_tokenOut).transfer(msg.sender, tokens);
-        }
+        IERC20(_tokenIn).transfer(deposits[_poolId].liquidityProvider, poolFee);
+        IERC20(_tokenOut).transfer(msg.sender, tokens);
     }
 
     function fetchQuote(
@@ -286,14 +224,6 @@ contract AMM {
             (pool.token0 == _tokenIn ? pool.amount0 : pool.amount1) +
             (_tokenQuantity - poolFeeFromBaseToken);
         recievableToken = (pool.liquidity * multiplierWEI) / divisibleToken;
-
-        console.log("pool.amount0 : ", pool.amount0);
-        console.log("pool.amount1 : ", pool.amount1);
-        console.log("pool.liquidity : ", pool.liquidity);
-        console.log("_tokenQuantity : ", _tokenQuantity);
-        console.log("poolFeeFromBaseToken : ", poolFeeFromBaseToken);
-        console.log("divisibleToken : ", divisibleToken);
-        console.log("recievableToken : ", recievableToken);
 
         require(
             (divisibleToken * recievableToken) / multiplierWEI <=
